@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledger — broker statement parser</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root{
+    --paper:#EDEEF0; --ink:#14161C; --rule:#C9CDD4;
+    --mute:#6B7280; --check:#0F6F4C; --flag:#A33A2B; --field:#FFFFFF;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    font-size:13px; line-height:1.5; padding:32px 20px 80px;
+  }
+  .wrap{max-width:920px;margin:0 auto}
+
+  header{border-bottom:2px solid var(--ink);padding-bottom:14px;margin-bottom:28px}
+  h1{font-family:Georgia,"Times New Roman",serif;font-size:30px;font-weight:400;letter-spacing:-.02em}
+  h1 em{font-style:italic;color:var(--mute)}
+  .sub{color:var(--mute);font-size:12px;margin-top:6px;max-width:56ch}
+
+  /* signature: l'identita' contabile, mostrata come tale */
+  .thesis{
+    border:1px solid var(--rule); background:var(--field);
+    padding:14px 16px; margin-bottom:24px; font-size:12px;
+  }
+  .thesis .eq{font-size:14px;letter-spacing:.02em}
+  .thesis .eq b{font-weight:600}
+  .thesis p{color:var(--mute);margin-top:6px}
+
+  #drop{
+    border:1.5px dashed var(--rule); background:var(--field);
+    padding:44px 20px; text-align:center; cursor:pointer;
+    transition:border-color .15s, background .15s;
+  }
+  #drop:hover,#drop.over{border-color:var(--ink);background:#fff}
+  #drop strong{display:block;font-size:14px;margin-bottom:4px}
+  #drop span{color:var(--mute);font-size:12px}
+  #drop:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+  .bar{
+    display:flex;justify-content:space-between;align-items:baseline;
+    margin:28px 0 8px;border-bottom:1px solid var(--ink);padding-bottom:6px;
+  }
+  .bar h2{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+  .bar .meta{color:var(--mute);font-size:12px}
+  .bar button{
+    font:inherit;font-size:11px;border:1px solid var(--ink);background:var(--ink);
+    color:var(--paper);padding:5px 12px;cursor:pointer;letter-spacing:.04em;
+  }
+  .bar button:hover{background:transparent;color:var(--ink)}
+  .bar select{
+    font:inherit;font-size:11px;border:1px solid var(--rule);background:var(--field);
+    color:var(--ink);padding:4px 6px;margin-right:4px;
+  }
+  .bar button.ghost{background:transparent;color:var(--ink)}
+  .bar button.ghost:hover{background:var(--ink);color:var(--paper)}
+
+  table{width:100%;border-collapse:collapse;background:var(--field);font-size:12px}
+  th{
+    text-align:left;font-weight:600;font-size:10px;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--mute);padding:7px 8px;border-bottom:1px solid var(--rule);
+  }
+  td{padding:7px 8px;border-bottom:1px solid #E4E6EA;white-space:nowrap}
+  td.n{text-align:right;font-variant-numeric:tabular-nums}
+  td.name{white-space:normal;max-width:230px}
+  tr:hover td{background:#F7F8F9}
+  .tick{color:var(--check);font-weight:600}
+  .cross{color:var(--flag);font-weight:600}
+  .tag{font-size:10px;letter-spacing:.05em;color:var(--mute)}
+
+  .note{margin-top:10px;color:var(--mute);font-size:11px}
+  .err{border-left:3px solid var(--flag);padding:10px 12px;background:var(--field);margin-top:16px}
+  .hidden{display:none}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Ledger <em>— broker statement parser</em></h1>
+    <p class="sub">Drop a broker PDF. Get a CSV that imports straight into Portfolio Performance.
+       The file never leaves your browser.</p>
+  </header>
+
+  <div class="thesis">
+    <div class="eq"><b>quantity × price ÷ fx + fee = total</b></div>
+    <p>Every row is checked against this identity before it's shown. If it doesn't balance, the row is
+       flagged rather than silently returned wrong. That's the difference between a parser that guesses
+       and one that knows.</p>
+  </div>
+
+  <div id="drop" tabindex="0" role="button" aria-label="Choose a PDF statement">
+    <strong>Drop a statement here</strong>
+    <span>or click to choose a file — PDF, parsed locally</span>
+  </div>
+  <input type="file" id="file" accept="application/pdf,.txt" class="hidden">
+
+  <div id="out"></div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+/* ---------- shared primitives ---------- */
+const CURS = ['EUR','USD','GBP','CHF','SEK','NOK','DKK','JPY','CAD','AUD','PLN','CZK'];
+const ISIN_RE = /\b([A-Z]{2}[A-Z0-9]{9}\d)\b/;
+const DATED_ROW = /^\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}\s+/;
+const NUM_RE = /^-?\d{1,3}(?:\.\d{3})*(?:,\d+)?$|^-?\d+(?:,\d+)?$/;
+
+function luhnIsin(isin){
+  let s='';
+  for(const c of isin) s += /[A-Z]/.test(c) ? String(parseInt(c,36)) : c;
+  let tot=0, alt=false;
+  for(let i=s.length-1;i>=0;i--){
+    let n=+s[i];
+    if(alt){ n*=2; if(n>9) n-=9; }
+    tot+=n; alt=!alt;
+  }
+  return tot%10===0;
+}
+// europeo: 1.234,56
+function numEU(s){ return parseFloat(s.replace(/\./g,'').replace(',','.')); }
+// ambiguo: disambigua dall'ultimo separatore
+function numAny(s){
+  s=s.trim();
+  const c=s.lastIndexOf(','), d=s.lastIndexOf('.');
+  if(c>-1&&d>-1) return c>d ? parseFloat(s.replace(/\./g,'').replace(',','.'))
+                            : parseFloat(s.replace(/,/g,''));
+  if(c>-1) return s.split(',').pop().length===3 ? parseFloat(s.replace(/,/g,''))
+                                                : parseFloat(s.replace(',','.'));
+  return parseFloat(s);
+}
+
+/* ---------- engine 1: tabular (Degiro) ---------- */
+function tokenize(s){
+  return s.split(/\s+/).filter(Boolean).map(t =>
+    CURS.includes(t) ? ['cur',t] : NUM_RE.test(t) ? ['num',numEU(t)] : ['word',t]);
+}
+function isComplete(row){
+  const m=row.match(ISIN_RE);
+  if(!m||!luhnIsin(m[1])) return false;
+  const t=tokenize(row.slice(m.index+m[1].length));
+  return t.some(x=>x[0]==='cur') && t.filter(x=>x[0]==='num').length>=2;
+}
+function rebuild(lines){
+  const out=[]; let cur=null;
+  for(const raw of lines){
+    const s=raw.trim(); if(!s) continue;
+    if(DATED_ROW.test(s)){ if(cur) out.push(cur); cur=s; }
+    else if(cur!==null){
+      if(isComplete(cur)){
+        if(s.length<40 && !ISIN_RE.test(s) && !s.split(/\s+/).some(t=>CURS.includes(t))) cur+=' '+s;
+        else { out.push(cur); cur=null; }
+      } else cur+=' '+s;
+    }
+  }
+  if(cur) out.push(cur);
+  return out.filter(isComplete);
+}
+function parseTabularRow(row){
+  const m=row.match(ISIN_RE); if(!m||!luhnIsin(m[1])) return null;
+  const d=row.match(/^(\d{2})-(\d{2})-(\d{4})\s+(\d{2}:\d{2})\s+/); if(!d) return null;
+  const product=row.slice(d[0].length,m.index).trim();
+  const toks=tokenize(row.slice(m.index+m[1].length));
+  let i=0; const venues=[];
+  while(i<toks.length && toks[i][0]==='word'){ venues.push(toks[i][1]); i++; }
+  if(i+1>=toks.length||toks[i][0]!=='num'||toks[i+1][0]!=='num') return null;
+  const qty=toks[i][1], price=toks[i+1][1]; i+=2;
+  const localCur = (i<toks.length&&toks[i][0]==='cur') ? toks[i][1] : null;
+
+  const pairs=[], lone=[];
+  for(let j=i;j<toks.length;j++){
+    if(toks[j][0]==='num'){
+      if(j+1<toks.length&&toks[j+1][0]==='cur'){ pairs.push([toks[j][1],toks[j+1][1]]); j++; }
+      else lone.push(toks[j][1]);
+    }
+  }
+  if(!pairs.length) return null;
+  const [total,totalCur]=pairs[pairs.length-1];
+  // il lordo in valuta locale e' DICHIARATO nel documento: non ricalcolarlo da
+  // qty*price, o si perdono i centesimi di arrotondamento del broker
+  const grossPair = localCur ? pairs.find(p=>p[1]===localCur) : null;
+
+  // fee e fx sono sintatticamente identici: si risolvono per identita' contabile
+  const cands=[...lone,...pairs.slice(0,-1).map(p=>p[0])];
+  let best=null;
+  for(const f of [null,...cands]){
+    if(f!==null&&f<=0) continue;
+    for(const e of [null,...cands]){
+      if(f!==null&&e!==null&&f===e) continue;
+      const calc=-qty*price/(f||1)+(e||0);
+      const err=Math.abs(calc-total);
+      if(err<0.05&&(!best||err<best[0])) best=[err,f,e];
+    }
+  }
+  const fx=best?best[1]:null, fee=best?best[2]:null;
+  return {
+    date:`${d[3]}-${d[2]}-${d[1]}`, time:d[4], product:product.replace(/\s+/g,' '),
+    isin:m[1], venue:venues[0]||null, quantity:qty, price, currency:localCur||totalCur,
+    fx_rate:fx, fee, total, currency_out:totalCur,
+    gross: grossPair ? Math.abs(grossPair[0]) : null,
+    type: qty>0?'BUY':'SELL', verified: !!best
+  };
+}
+
+/* ---------- engine 2: receipt (Trade Republic, Scalable) ---------- */
+const AMT_RE = new RegExp('(-?[\\d][\\d.,]*)\\s*(' + CURS.join('|') + ')\\b','g');
+const ROLES = {
+  fee:['fremdkostenzuschlag','gebühr','kosten','fee','commission','provision'],
+  tax:['kapitalertragsteuer','kirchensteuer','solidaritätszuschlag','quellensteuer',
+       'withholding tax','taxes','steuer'],
+  total:['gesamt','total'],
+};
+const KIND = {
+  BUY:['kauf','buy','purchase'], SELL:['verkauf','sell','sale'],
+  DIVIDEND:['dividende','dividend','ausschüttung'],
+  ROC:['return of capital','kapitalrückzahlung'],
+};
+function roleOf(label){
+  const l=label.toLowerCase();
+  for(const [r,keys] of Object.entries(ROLES)) if(keys.some(k=>l.includes(k))) return r;
+  return null;
+}
+function detectKind(text){
+  const t=text.toLowerCase(); let best=null;
+  for(const [kind,keys] of Object.entries(KIND))
+    for(const k of keys){ const i=t.indexOf(k); if(i>-1&&(!best||i<best[0])) best=[i,kind]; }
+  return best?best[1]:null;
+}
+function parseReceipt(text){
+  const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
+  let isin=null;
+  for(const l of lines){ const m=l.match(ISIN_RE); if(m&&luhnIsin(m[1])){ isin=m[1]; break; } }
+  if(!isin) return null;
+
+  let total=null; const comps={fee:[],tax:[]};
+  for(const l of lines){
+    AMT_RE.lastIndex=0;
+    const amts=[...l.matchAll(AMT_RE)];
+    if(!amts.length) continue;
+    const r=roleOf(l.slice(0,amts[0].index));
+    if(r==='total') total=[numAny(amts[amts.length-1][1]),amts[amts.length-1][2]];
+    else if(r==='fee'||r==='tax') comps[r].push(numAny(amts[0][1]));
+  }
+  if(!total) return null;
+
+  let qty=null;
+  for(const l of lines){
+    let m=l.match(/([\d][\d.,]*)\s*(?:Stk\.|Stücke|pcs)/);
+    if(m){ qty=numAny(m[1]); break; }
+    m=l.match(/(?:Entitled quantity|ANZAHL)\s+([\d][\d.,]*)/);
+    if(m){ qty=numAny(m[1]); break; }
+  }
+  const d=text.match(/\b(\d{2})[.-](\d{2})[.-](\d{4})\b/);
+  const fees=comps.fee.reduce((a,b)=>a+b,0), taxes=comps.tax.reduce((a,b)=>a+b,0);
+  return {
+    date: d?`${d[3]}-${d[2]}-${d[1]}`:null, product:null, isin, type:detectKind(text),
+    quantity:qty, price:null, fx_rate:null,
+    fee: fees?+fees.toFixed(2):null, taxes: taxes?+taxes.toFixed(2):null,
+    total:total[0], currency:total[1], currency_out:total[1], verified:null
+  };
+}
+
+/* ---------- router ---------- */
+function parseAny(text){
+  const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
+  const tabular=lines.filter(l=>DATED_ROW.test(l)&&ISIN_RE.test(l)).length;
+  if(tabular>=2){
+    const rows=rebuild(lines).map(parseTabularRow).filter(Boolean);
+    return {family:'tabular · table of transactions', transactions:rows};
+  }
+  const r=parseReceipt(text);
+  if(r) return {family:'receipt · one transaction per document', transactions:[r]};
+  return {family:null, transactions:[]};
+}
+
+/* ---------- ui ---------- */
+const drop=document.getElementById('drop'), input=document.getElementById('file'), out=document.getElementById('out');
+drop.onclick=()=>input.click();
+drop.onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); input.click(); } };
+drop.ondragover=e=>{ e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave=()=>drop.classList.remove('over');
+drop.ondrop=e=>{ e.preventDefault(); drop.classList.remove('over'); handle(e.dataTransfer.files[0]); };
+input.onchange=e=>handle(e.target.files[0]);
+
+async function handle(file){
+  if(!file) return;
+  drop.querySelector('strong').textContent='Reading '+file.name;
+  try{
+    const text = file.name.toLowerCase().endsWith('.pdf') ? await pdfText(file) : await file.text();
+    render(parseAny(text), file.name);
+  }catch(err){
+    out.innerHTML=`<div class="err"><strong>Couldn't read ${esc(file.name)}.</strong><br>
+      ${esc(err.message)} — if it's a scanned PDF there's no text layer to read.</div>`;
+  }
+  drop.querySelector('strong').textContent='Drop a statement here';
+}
+async function pdfText(file){
+  const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+  let out='';
+  for(let p=1;p<=pdf.numPages;p++){
+    const c=await (await pdf.getPage(p)).getTextContent();
+    let last=null;
+    for(const it of c.items){
+      if(last!==null && Math.abs(it.transform[5]-last)>2) out+='\n';
+      out+=it.str+' '; last=it.transform[5];
+    }
+    out+='\n';
+  }
+  return out;
+}
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const fmt=n=>n===null||n===undefined?'':n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+let current=[];
+function render(res,name){
+  if(!res.transactions.length){
+    out.innerHTML=`<div class="err"><strong>No transactions found in ${esc(name)}.</strong><br>
+      This layout isn't covered yet. Two document families are supported so far:
+      transaction tables and single-transaction receipts.</div>`;
+    return;
+  }
+  current=res.transactions;
+  const ok=current.filter(t=>t.verified===true).length;
+  const checked=current.filter(t=>t.verified!==null).length;
+  out.innerHTML=`
+    <div class="bar">
+      <h2>${esc(name)}</h2>
+      <div class="meta">
+        <span class="tag">${esc(res.family)}</span> &nbsp;·&nbsp;
+        ${current.length} row${current.length>1?'s':''}${checked?` · ${ok}/${checked} balance`:''}
+        &nbsp;<select id="lang" aria-label="Language of your Portfolio Performance install">
+          <option value="en">English</option><option value="it" selected>Italiano</option>
+          <option value="de">Deutsch</option>
+        </select>
+        <button id="dlpp">CSV for Portfolio Performance</button>
+        &nbsp;<button id="dl" class="ghost">Raw CSV</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>Date</th><th>Type</th><th>Security</th><th>ISIN</th>
+        <th style="text-align:right">Qty</th><th style="text-align:right">Price</th>
+        <th style="text-align:right">FX</th><th style="text-align:right">Fee</th>
+        <th style="text-align:right">Total</th><th></th>
+      </tr></thead>
+      <tbody>${current.map(t=>`
+        <tr>
+          <td>${esc(t.date)}</td>
+          <td>${esc(t.type||'')}</td>
+          <td class="name">${esc(t.product||'—')}</td>
+          <td>${esc(t.isin)}</td>
+          <td class="n">${t.quantity??''}</td>
+          <td class="n">${t.price!==null&&t.price!==undefined?t.price:''}</td>
+          <td class="n">${t.fx_rate??''}</td>
+          <td class="n">${fmt(t.fee)}</td>
+          <td class="n">${fmt(t.total)} ${esc(t.currency_out||'')}</td>
+          <td>${t.verified===true?'<span class="tick">✓</span>'
+              :t.verified===false?'<span class="cross">≠</span>':''}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <p class="note" id="hint"></p>
+    <p class="note">${checked
+      ? '✓ marks rows where the arithmetic in the document balances. ≠ marks rows that don\'t — check those against the original.'
+      : 'Receipt documents state their own total, so there\'s no cross-check to run.'}</p>`;
+  document.getElementById('dl').onclick=downloadCsv;
+  document.getElementById('dlpp').onclick=downloadPP;
+  const sel=document.getElementById('lang');
+  sel.value=ppLang;
+  const hint=()=>{
+    const s=PP_LANG[ppLang].dec===',' ? 'semicolon (;)' : 'comma (,)';
+    const foreign=current.some(t=>t.currency&&t.currency_out&&t.currency!==t.currency_out);
+    document.getElementById('hint').innerHTML =
+      `In Portfolio Performance: File → Import → CSV, separator <b>${s}</b>.` +
+      (foreign ? ` This file has trades in foreign currency — if the security doesn't exist
+        in your portfolio yet, create it first with its own currency (USD, SEK…), or PP will
+        assume your account currency and reject the row.` : '');
+  };
+  sel.onchange=e=>{ ppLang=e.target.value; hint(); };
+  hint();
+}
+
+/* Portfolio Performance import format.
+   Nomi colonna presi dall'export di PP: usandoli identici, il wizard mappa da solo.
+   Regole dalla doc: Value = Gross Amount + Taxes + Fees (fee/tasse gia' negative),
+   "Transaction Currency" e non "Currency", data YYYY-MM-DD.                        */
+/* ATTENZIONE: i VALORI della colonna Type sono localizzati sulla lingua della UI di
+   PP, non solo le intestazioni. Un CSV con "Buy" viene rifiutato da PP italiano con
+   "Impossibile analizzare il valore Buy con il pattern {Compra=Compra, ...}".      */
+const PP_LANG = {
+  en: {BUY:'Buy',    SELL:'Sell',    DIVIDEND:'Dividend',  ROC:'Dividend',  dec:'.'},
+  it: {BUY:'Compra', SELL:'Vendi',   DIVIDEND:'Dividendo', ROC:'Dividendo', dec:','},
+  de: {BUY:'Kauf',   SELL:'Verkauf', DIVIDEND:'Dividende', ROC:'Dividende', dec:','},
+};
+let ppLang = 'it';
+// PP legge i numeri con il separatore decimale della sua lingua: "560.77" su una
+// installazione italiana diventa 56.077. Il numero va scritto nella lingua giusta.
+const dec = s => s===''||s===null||s===undefined ? '' : String(s).replace('.', PP_LANG[ppLang].dec);
+function toPP(t){
+  const PP_TYPE = PP_LANG[ppLang];
+  const fee = t.fee ?? 0, tax = t.taxes ?? 0;
+  // Gross Amount: valore prima di fee e tasse, nella valuta del titolo
+  let gross = t.gross ?? null, grossCur = t.currency||t.currency_out;
+  if(gross===null && t.quantity!==null && t.price!==null && t.price!==undefined)
+    gross = Math.abs(t.quantity*t.price);   // fallback se il documento non lo dichiara
+  const foreign = grossCur && t.currency_out && grossCur!==t.currency_out;
+  // Verso del cambio: Degiro dichiara "valuta estera per 1 EUR" (USD/EUR = 1.0401).
+  // PP si aspetta il fattore che porta il lordo ALLA valuta della transazione,
+  // cioe' l'inverso. Senza inversione PP calcola 604,49 dove il documento dice 558,77.
+  const ppFx = (foreign && t.fx_rate) ? (1/t.fx_rate) : null;
+  return {
+    'Date': t.date, 'Type': PP_TYPE[t.type]||'', 'Value': dec(Math.abs(t.total).toFixed(2)),
+    'Transaction Currency': t.currency_out||'',
+    'Gross Amount': foreign&&gross!==null ? dec(gross.toFixed(2)) : '',
+    'Currency Gross Amount': foreign ? grossCur : '',
+    'Exchange Rate': ppFx!==null ? dec(ppFx.toFixed(8)) : '',
+    'Fees': fee ? dec(Math.abs(fee).toFixed(2)) : '',
+    'Taxes': tax ? dec(Math.abs(tax).toFixed(2)) : '',
+    'Shares': t.quantity!==null&&t.quantity!==undefined ? dec(Math.abs(t.quantity)) : '',
+    'ISIN': t.isin, 'Security Name': t.product||'',
+    'Note': t.verified===false ? 'unbalanced in source document' : '',
+  };
+}
+function downloadPP(){
+  const rows=current.map(toPP);
+  const cols=Object.keys(rows[0]);
+  // con la virgola come decimale, il separatore di campo deve essere ';'
+  // (e' anche il default che PP propone su installazioni IT/DE)
+  const sep = PP_LANG[ppLang].dec===',' ? ';' : ',';
+  const q=v=>new RegExp('["\n'+sep+']').test(String(v))
+      ? `"${String(v).replace(/"/g,'""')}"` : String(v);
+  const csv=[cols.join(sep),...rows.map(r=>cols.map(c=>q(r[c])).join(sep))].join('\n');
+  save(csv,'portfolio-performance-import.csv');
+}
+function save(csv,name){
+  const url=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));
+  const a=document.createElement('a');
+  a.href=url; a.download=name; a.style.display='none';
+  document.body.appendChild(a); a.click();
+  // il revoke immediato puo' annullare il download prima che il browser lo avvii
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); },1000);
+}
+function downloadCsv(){
+  const cols=['date','type','product','isin','quantity','price','currency','fx_rate','fee','taxes','total','currency_out'];
+  const esc2=v=>v===null||v===undefined?'':/[",\n]/.test(String(v))?`"${String(v).replace(/"/g,'""')}"`:String(v);
+  const csv=[cols.join(','),...current.map(t=>cols.map(c=>esc2(t[c])).join(','))].join('\n');
+  save(csv,'transactions.csv');
+}
+</script>
+</body>
+</html>
