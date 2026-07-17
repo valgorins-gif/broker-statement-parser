@@ -22,10 +22,11 @@ quantity × price ÷ fx + fee = total
 
 The document contains its own proof. Rows that don't balance are flagged, not silently returned wrong.
 
-**Two structural families, not one parser per broker.** Statements come in shapes, not just layouts:
+**Three structural families, not one parser per broker.** Statements come in shapes, not just layouts:
 
 - *tabular* — one transaction per line (Degiro)
 - *receipt* — one transaction per document, facts scattered across labelled sections (Trade Republic, Scalable Capital)
+- *report* — transaction rows carry a ticker, not an ISIN; the document contains its own lookup table (Revolut)
 
 Within a family, a new broker costs vocabulary entries, not code. Trade Republic and Scalable Capital run on the same engine and the same dictionary.
 
@@ -36,7 +37,7 @@ Within a family, a new broker costs vocabulary entries, not code. Trade Republic
 | Degiro | 21/21 transactions, all arithmetically verified |
 | Trade Republic | buy/sell, dividends (incl. foreign currency + German tax) |
 | Scalable Capital | dividends, return of capital |
-| Revolut | not yet — different shape again (ticker→ISIN lookup, no ISIN in the transaction rows) |
+| Revolut | 16/16 trades, tickers resolved against the holdings table |
 
 Output imports into Portfolio Performance without a mapping wizard. Localised for English, Italian and German — PP validates the *values* of the Type column against its UI language, so `Buy` is rejected by an Italian install.
 
