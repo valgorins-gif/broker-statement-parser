@@ -1,55 +1,68 @@
 # Broker statement parser
 
-Turns broker PDF statements into clean CSV. Runs entirely in your browser — the file never leaves your computer.
+Turns broker PDF statements into CSV that imports into Portfolio Performance. Runs entirely in your browser — the file never leaves your computer.
 
 **[Try it →](https://valgorins-gif.github.io/broker-statement-parser/)**
 
-## Why this exists
+## What it does well
 
-Broker statement parsing is a maintenance treadmill. Brokers change their PDF layout without notice, the parser breaks, someone opens an issue, a volunteer fixes it. Portfolio Performance has 397 open issues; some import bugs have been open since 2020.
+One thing, and it does it with a property most parsers don't have: **it knows when it's wrong.**
 
-This project takes a different approach to the same problem.
-
-## How it's different
-
-**It anchors on the ISIN, not on column positions.** An ISIN is the only token in a statement line that verifies itself (Luhn checksum). Everything else is read outward from it by token type. When a broker drops a column — and they do, silently, whenever a fee happens to be zero — a positional parser silently shifts every field by one. This one doesn't count columns, so there's nothing to shift.
-
-**It knows when it's right.** Fee and exchange rate are syntactically identical in a statement: a number followed by a currency. Rather than guessing with heuristics, the parser tries the combinations and keeps the one where
+Fee and exchange rate are syntactically identical in a statement line — a number followed by a currency. Rather than guessing with heuristics, the parser tries the combinations and keeps the one where
 
 ```
 quantity × price ÷ fx + fee = total
 ```
 
-The document contains its own proof. Rows that don't balance are flagged, not silently returned wrong.
+The document contains its own proof. Rows that don't balance are flagged, not silently returned wrong. This matters more than it sounds: a positional parser that shifts by one column returns plausible numbers that are simply false, and nobody notices until tax season.
 
-**Three structural families, not one parser per broker.** Statements come in shapes, not just layouts:
+It also anchors on the ISIN rather than on column positions. An ISIN is the only self-verifying token in the line (Luhn checksum), so when a broker drops a column — which they do silently, whenever a fee happens to be zero — nothing shifts, because nothing is counting columns.
 
-- *tabular* — one transaction per line (Degiro)
-- *receipt* — one transaction per document, facts scattered across labelled sections (Trade Republic, Scalable Capital)
-- *report* — transaction rows carry a ticker, not an ISIN; the document contains its own lookup table (Revolut)
+## Honest scope
 
-Within a family, a new broker costs vocabulary entries, not code. Trade Republic and Scalable Capital run on the same engine and the same dictionary.
+Tested against Portfolio Performance's own test corpus (2,642 real statement files across 130 brokers, public in their repo):
 
-## Status
+| | files | extracted something |
+|---|---|---|
+| Degiro | 66 | 21 (32%) |
+| Trade Republic | 241 | 123 (51%) |
+| Scalable Capital | 65 | 18 (28%) |
+
+**Read that as a limitation, not a score.** It handles transaction *tables* — statements listing buys and sells. What it does not handle is the long tail that makes up most of the corpus: account statements (`Kontoauszug`, `EstrattoConto`, `EstadoDeCuenta`), crypto trades, corporate actions, delistings, interest, and a dozen other document classes per broker.
+
+That long tail is the actual work. Portfolio Performance has 66 test files for Degiro alone because it takes 66 to cover it. Their per-broker parsers aren't over-engineered — the domain is.
+
+## Coverage
 
 | | |
 |---|---|
-| Degiro | 21/21 transactions, all arithmetically verified |
-| Trade Republic | buy/sell, dividends (incl. foreign currency + German tax) |
+| Degiro | transaction tables, incl. foreign currency and FX |
+| Trade Republic | buy/sell and dividend receipts (incl. German tax breakdown) |
 | Scalable Capital | dividends, return of capital |
-| Revolut | 16/16 trades, tickers resolved against the holdings table |
+| Revolut | trades, tickers resolved against the holdings table |
 
-Output imports into Portfolio Performance without a mapping wizard. Localised for English, Italian and German — PP validates the *values* of the Type column against its UI language, so `Buy` is rejected by an Italian install.
+Three structural shapes, one engine each: *tabular* (one transaction per line), *receipt* (one transaction per document, facts across labelled sections), *report* (rows carry a ticker; the document holds its own lookup table). Within a shape, another broker costs vocabulary entries. A new shape costs an engine.
 
-## What it doesn't do yet
+## Portfolio Performance export
 
-- Splits, mergers, and most corporate actions
-- Scanned PDFs (no text layer to read)
-- The vocabulary covers German and English labels only
+Output imports without a mapping wizard. Some things that cost me a few evenings and aren't in any documentation:
+
+- PP validates the **values** of the Type column against its UI language — `Buy` is rejected by an Italian install, which wants `Compra`
+- Decimal separator follows the UI language too, so the field separator has to follow with it (`;` for IT/DE)
+- The exchange rate is expected inverted relative to how Degiro states it
+- Securities in a foreign currency must exist in the portfolio first, or PP assumes the account currency and rejects the row
+
+The language selector in the export handles the first three.
+
+## Not covered
+
+- Account statements, corporate actions, crypto, interest, most non-trade documents
+- Scanned PDFs (no text layer)
+- Label vocabulary is German and English only
 
 ## Tested against
 
-Real statements from the Portfolio Performance issue tracker — files reported as unparseable, including [#4418](https://github.com/portfolio-performance/portfolio/issues/4418) (Degiro transaction.pdf unreadable for a year).
+Real files from the Portfolio Performance issue tracker and test corpus, including [#4418](https://github.com/portfolio-performance/portfolio/issues/4418) — a Degiro statement that had been unparseable for a year. That file: 21/21 transactions, all balancing.
 
 ---
 
